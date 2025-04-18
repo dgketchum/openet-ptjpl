@@ -5,147 +5,167 @@ from datetime import datetime
 
 import ee
 import geopandas as gpd
-import openet.core
+import openet
 from tqdm import tqdm
 
-from openet.ptjpl.ee_utils import landsat_masked, is_authorized
+from openet.ptjpl.ee_utils import is_authorized
 
 sys.path.insert(0, os.path.abspath('../..'))
 sys.setrecursionlimit(5000)
 
-EC_POINTS = 'users/dgketchum/fields/flux'
+LANDSAT_COLLECTIONS = ['LANDSAT/LT04/C02/T1_L2',
+                       'LANDSAT/LT05/C02/T1_L2',
+                       'LANDSAT/LE07/C02/T1_L2',
+                       'LANDSAT/LC08/C02/T1_L2',
+                       'LANDSAT/LC09/C02/T1_L2']
 
-STATES = ['AZ', 'CA', 'CO', 'ID', 'MT', 'NM', 'NV', 'OR', 'UT', 'WA', 'WY']
-WEST_STATES = 'users/dgketchum/boundaries/western_11_union'
-EAST_STATES = 'users/dgketchum/boundaries/eastern_38_dissolved'
 
-
-def export_et_fraction(shapefile, asset_root, check_dir=None, grid_spec=None, feature_id='FID', select=None,
-                       start_yr=2000, end_yr=2024):
+def export_et_fraction(shapefile, asset_root, feature_id='FID', select=None, start_yr=2000, end_yr=2024):
+    """"""
     df = gpd.read_file(shapefile)
-    df.index = df[feature_id]
+    df = df.set_index(feature_id, drop=False)
+    df = df.sample(frac=1)
 
-    assert df.crs.srs == 'EPSG:5071'
-
-    df = df.to_crs(epsg=4326)
+    original_crs = df.crs
+    assert original_crs and original_crs.srs == 'EPSG:4326'
 
     skipped, exported = 0, 0
 
-    for fid, row in tqdm(df.iterrows(), desc='Export PTJPL', total=df.shape[0]):
+    for fid, row in df.iterrows():
+
+        if row['geometry'].geom_type == 'Point':
+            polygon = ee.Geometry.Point(
+                [row['geometry'].x, row['geometry'].y], proj=original_crs.srs
+            ).buffer(100)
+        elif row['geometry'].geom_type == 'Polygon':
+            polygon = ee.Geometry.Polygon(
+                coords=[[c[0], c[1]] for c in row['geometry'].exterior.coords],
+                proj=original_crs.srs
+            ).buffer(100)
+        else:
+            skipped += (end_yr - start_yr + 1)
+            continue
 
         for year in range(start_yr, end_yr + 1):
 
             if select is not None and fid not in select:
                 continue
 
-            site = row[feature_id]
-            grid_sz = row['grid_size']
-
-            if grid_spec is not None and grid_sz != grid_spec:
+            if row['iso'] not in ['FR', 'BE', 'DE', 'AT', 'IT', 'GR', 'RO', 'ES']:
                 continue
 
-            polygon = ee.Geometry.Polygon([[c[0], c[1]] for c in row['geometry'].exterior.coords])
-            fc = ee.FeatureCollection(ee.Feature(polygon, {feature_id: site}))
+            if not (row['glc10_lc'] == 10.0 and row['modis_lc'] == 12.0):
+                continue
 
-            coll = landsat_masked(year, fc)
-            scenes = coll.aggregate_histogram('system:index').getInfo()
+            if fid == "Delta de l'Ebre":
+                continue
 
-            for img_id in scenes:
-                splt = img_id.split('_')
-                _name = '_'.join(splt[-3:])
-                inst = splt[-3]
-                tile = splt[-2]
-                p, r = int(tile[:3]), int(tile[-3:])
+            coll = openet.ptjpl.Collection(LANDSAT_COLLECTIONS, start_date=f'{start_yr}-01-01',
+                                           end_date=f'{end_yr}-12-31', geometry=polygon,
+                                           cloud_cover_max=70)
 
-                landsat_img = ee.Image(f'LANDSAT/{inst}/C02/T1_L2/{_name}')
-                info = landsat_img.getInfo()
-                proj = landsat_img.select('SR_B1').getInfo()['bands'][0]
-                dims = proj['dimensions']
-                crs = proj['crs']
-                crs_transform = proj['crs_transform']
-                dims = f'{dims[0]}x{dims[1]}'
-                model_package_name = 'ptjpl'
+            scenes = coll.get_image_ids()
+            scenes = list(set(scenes))
+            scenes = sorted(scenes, key=lambda item: item.split('_')[-1])
 
-                export_id = f'{model_package_name}_{info['id']}'
+            with tqdm(scenes, desc=f'Export PTJPL for {fid}', total=len(scenes)) as pbar:
+                for img_id in scenes:
+                    pbar.set_description(f'Export PTJPL for {fid} (Processing: {img_id})')
+                    splt = img_id.split('/')
+                    coll_id = '/'.join(splt[:4])
+                    splt = splt[-1].split('_')
+                    _name = '_'.join(splt[-3:])
+                    tile = splt[-2]
+                    p, r = int(tile[:3]), int(tile[-3:])
 
-                etf = openet.ptjpl.Image.from_landsat_c2_sr(landsat_img,
-                                                            et_reference_source='IDAHO_EPSCOR/GRIDMET',
-                                                            et_reference_band='eto',
-                                                            et_reference_factor=1.0,
-                                                            et_reference_resample='bilinear',
-                                                            ).et_fraction
+                    ptjpl_kwargs = dict(ta_source='ERA5LAND',
+                                        ea_source='ERA5LAND',
+                                        windspeed_source='ERA5LAND',
+                                        rs_source='ERA5LAND',
+                                        LWin_source='ERA5LAND')
 
-                properties = {
-                    'build_date': datetime.today().strftime('%Y-%m-%d'),
-                    'coll_id': os.path.dirname(info['id']),
-                    'core_version': openet.core.__version__,
-                    'image_id': info['id'],
-                    'model_name': 'openet-ptjpl',
-                    'model_version': "0.4.1",
-                    'scale_factor': 1.0 / 10000,
-                    'scene_id': _name,
-                    'wrs2_path': p,
-                    'wrs2_row': r,
-                    'wrs2_tile': tile,
-                    'CLOUD_COVER': info['properties']['CLOUD_COVER'],
-                    'CLOUD_COVER_LAND': info['properties']['CLOUD_COVER_LAND'],
-                    'system:index': _name,
-                    'system:time_start': info['properties']['system:time_start'],
-                }
+                    etf = openet.ptjpl.Image.from_landsat_c2_sr(img_id,
+                                                                et_reference_source='ERA5LAND',
+                                                                et_reference_band='eto',
+                                                                et_reference_factor=1.0,
+                                                                et_reference_resample='bilinear',
+                                                                **ptjpl_kwargs
+                                                                ).et_fraction
 
-                etf.set(properties)
+                    info = ee.Image(img_id).getInfo()
+                    proj = etf.select('et_fraction').getInfo()['bands'][0]
+                    dims = proj['dimensions']
+                    crs = proj['crs']
+                    crs_transform = proj['crs_transform']
+                    dims = f'{dims[0]}x{dims[1]}'
 
-                export_path = os.path.join(asset_root, _name)
+                    properties = {
+                        'build_date': datetime.today().strftime('%Y-%m-%d'),
+                        'coll_id': coll_id,
+                        'core_version': openet.core.__version__,
+                        'image_id': img_id,
+                        'model_name': 'openet-ptjpl',
+                        'model_version': "0.4.1",
+                        'scale_factor': 1.0 / 10000,
+                        'scene_id': _name,
+                        'wrs2_path': p,
+                        'wrs2_row': r,
+                        'wrs2_tile': tile,
+                        'CLOUD_COVER': info['properties']['CLOUD_COVER'],
+                        'CLOUD_COVER_LAND': info['properties']['CLOUD_COVER_LAND'],
+                        'system:index': _name,
+                        'system:time_start': info['properties']['system:time_start'],
+                    }
 
-                task = ee.batch.Export.image.toAsset(
-                    etf,
-                    description=_name,
-                    assetId=export_path,
-                    dimensions=dims,
-                    crs=crs,
-                    crsTransform=crs_transform,
-                    maxPixels=1e13)
+                    etf = etf.set(properties)
 
-                try:
-                    task.start()
-                    print(_name)
-                    exit()
-                except ee.ee_exception.EEException as e:
-                    print('{}, waiting on '.format(e), _name, '......')
-                    time.sleep(600)
-                    task.start()
-                exported += 1
+                    export_path = os.path.join(asset_root, _name)
+
+                    task = ee.batch.Export.image.toAsset(
+                        etf,
+                        description=_name,
+                        assetId=export_path,
+                        dimensions=dims,
+                        crs=crs,
+                        crsTransform=crs_transform,
+                        maxPixels=1e13)
+
+                    try:
+                        task.start()
+                    except ee.ee_exception.EEException as e:
+                        print('{}, waiting on '.format(e), _name, '......')
+                        time.sleep(600)
+                        task.start()
+
+                    exported += 1
 
 
 if __name__ == '__main__':
 
     is_authorized()
 
-    bucket = 'wudr'
+    project = '6_Flux_International'
 
-    home = os.path.expanduser('~')
-    root = os.path.join(home, 'PycharmProjects', 'swim-rs')
-    shapefile_path = os.path.join(root, 'footprints', 'flux_static_footprints.shp')
+    root = '/data/ssd2/swim'
+    data = os.path.join(root, project, 'data')
+    project_ws_ = os.path.join(root, project)
+    if not os.path.isdir(root):
+        root = '/home/dgketchum/PycharmProjects/swim-rs'
+        project_ws_ = os.path.join(root, 'tutorials', project)
+        data = os.path.join(project_ws_, 'data')
 
-    data = os.path.join(root, 'tutorials', '4_Flux_Network', 'data')
-    landsat_dst = os.path.join(data, 'landsat')
-
-    fields_gridmet = os.path.join(data, 'gis', 'flux_fields_gfid.shp')
-
-    fdf = gpd.read_file(fields_gridmet)
-    target_states = ['AZ', 'CA', 'CO', 'ID', 'MT', 'NM', 'NV', 'OR', 'UT', 'WA', 'WY']
-    state_idx = [i for i, r in fdf.iterrows() if r['field_3'] in target_states]
-    fdf = fdf.loc[state_idx]
-    sites_ = list(set(fdf['field_1'].to_list()))
-    sites_.sort()
+    shapefile_ = os.path.join(data, 'gis', '6_Flux_International.shp')
 
     # Volk static footprints
-    FEATURE_ID = 'site_id'
-    state_col = 'state'
+    FEATURE_ID = 'sid'
+
+    # state_col = 'state'
     asset_root_ = 'users/dgketchum/openet/ptjpl/c02'
 
+    sites_ = ["Delta de l'Ebre"]
+
     for m in ['ptjpl']:
-        export_et_fraction(shapefile_path, asset_root_, check_dir=None, grid_spec=3, feature_id=FEATURE_ID,
-                           start_yr=2016, end_yr=2024)
+        export_et_fraction(shapefile_, asset_root_, feature_id=FEATURE_ID, start_yr=2015, end_yr=2024,
+                           select=None)
 
 # ========================= EOF =======================================================================================
